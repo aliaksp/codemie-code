@@ -98,6 +98,14 @@ describe('collectEditLineStats', () => {
     ).toEqual({ linesAdded: 2, linesRemoved: 1 });
   });
 
+  it('counts an overwrite that changed nothing (type update, empty patch) as zero, not by its content', () => {
+    expect(
+      collectEditLineStats([
+        { type: 'user', toolUseResult: { type: 'update', structuredPatch: [], content: 'a\nb\n' } },
+      ])
+    ).toEqual({ linesAdded: 0, linesRemoved: 0 });
+  });
+
   it('counts a create that carries a non-empty patch by its patch', () => {
     expect(
       collectEditLineStats([
