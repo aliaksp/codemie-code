@@ -7,6 +7,7 @@
 
 import { MigrationRunner } from '../dist/migrations/index.js';
 import { checkAndPromptForUpdate } from '../dist/utils/cli-updater.js';
+import { logger } from '../dist/utils/logger.js';
 
 // Tolerate EPIPE when stdout/stderr is piped into a consumer that closes early
 // (e.g. `codemie | head -1`). Without a handler, Node throws on the next write
@@ -18,12 +19,20 @@ for (const stream of [process.stdout, process.stderr]) {
   });
 }
 
+// A process an agent runs as a hook: its stdout is the agent's protocol channel
+// (Claude Code adds a hook's stdout to the model's context), so start-up output
+// stays off it, and no update check or prompt runs inside the agent's hook.
+const isHookProcess = process.argv[2] === 'hook' || process.argv[2] === 'sound';
+if (isHookProcess) {
+  logger.setConsoleStream(process.stderr);
+}
+
 // Auto-run pending migrations (happens at startup)
 // Migrations are tracked in ~/.codemie/migrations.json and only run once
 try {
   if (await MigrationRunner.hasPending()) {
     await MigrationRunner.runPending({
-      silent: false  // Show migration messages to user
+      silent: isHookProcess  // Show migration messages to user, except in a hook
     });
   }
 } catch (error) {
@@ -35,7 +44,7 @@ try {
 // Skip in test environments to avoid timeouts and network calls during testing
 // Non-blocking: failures don't prevent CLI from running
 const isTestEnvironment = process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
-if (!isTestEnvironment) {
+if (!isTestEnvironment && !isHookProcess) {
   try {
     await checkAndPromptForUpdate();
   } catch (error) {
@@ -45,12 +54,14 @@ if (!isTestEnvironment) {
 
 // Once-per-upgrade "What's new" notice from CHANGELOG.md (shares the
 // CODEMIE_TIPS off switch with feature tips). Non-blocking, minimal stdout.
-// Skipped for scripted/piped use (stdout not a TTY) and for invocations that
-// produce their own output contract (--version/-V/--task/--help).
+// Shown only when stdout is a terminal (a pipe or a file is not; undefined
+// isTTY counts as not a terminal) and skipped for invocations that produce
+// their own output contract (--version/-V/--task/--help). A skipped notice
+// writes no marker, so it shows on the next run in a terminal.
 const skipNoticeArgs = new Set(['--version', '-V', '--task', '--help']);
 const hasOutputContractArg = process.argv.slice(2).some(arg => skipNoticeArgs.has(arg));
-const isInteractiveTerminal = process.stdout.isTTY !== false; // undefined -> treat as TTY
-if (!isTestEnvironment && isInteractiveTerminal && !hasOutputContractArg) {
+const isInteractiveTerminal = process.stdout.isTTY === true;
+if (!isTestEnvironment && !isHookProcess && isInteractiveTerminal && !hasOutputContractArg) {
   try {
     const { readFileSync } = await import('node:fs');
     const { default: chalk } = await import('chalk');
@@ -71,7 +82,9 @@ if (!isTestEnvironment && isInteractiveTerminal && !hasOutputContractArg) {
         // Fresh install (no marker) — record silently, no "Updated to" banner
         markVersionSeen(currentVersion);
       } else if (lastSeenVersion !== currentVersion) {
-        const entries = getReleaseNotes(currentVersion);
+        // Only this version's own entry: the newest-entry fallback would title
+        // another version's notes as this upgrade.
+        const entries = getReleaseNotes(currentVersion).filter(entry => entry.version === currentVersion);
         if (entries.length > 0) {
           console.log(chalk.dim(`✨ Updated to ${currentVersion} — here's what changed:`));
           renderReleaseNotes(entries, { maxItems: 6 });

@@ -10,6 +10,8 @@ import * as path from 'path';
 import { ConfigLoader } from '../config.js';
 import type { MultiProviderConfig, CodeMieIntegrationInfo } from '../../env/types.js';
 import * as paths from '../paths.js';
+import { PassThrough } from 'node:stream';
+import { logger } from '../logger.js';
 
 // Test utilities
 const TEST_DIR = path.join(process.cwd(), 'tmp-test-config');
@@ -732,6 +734,36 @@ describe('ConfigLoader - workspace resolution and project-only composition', () 
 
       expect(merged.codeMieUrl).toBe('https://local-workspace.example.com');
       expect(sources['codeMieUrl']?.source).toBe('project');
+    });
+
+    it('writes the profile-protection debug line to the logger console stream, not stdout', async () => {
+      await writeGlobal('dbg', {
+        dbg: {
+          provider: 'ai-run-sso',
+          baseUrl: 'https://prod.example.com/code-assistant-api',
+          model: 'profile-model',
+          name: 'dbg',
+          debug: true
+        }
+      });
+      process.env.CODEMIE_MODEL = 'env-model';
+      const stream = new PassThrough();
+      let captured = '';
+      stream.on('data', (chunk: Buffer) => { captured += chunk.toString(); });
+      const stdoutSpy = vi.spyOn(process.stdout, 'write');
+      logger.setConsoleStream(stream);
+      try {
+        const cfg = await ConfigLoader.load(path.join(TEST_DIR, 'project'), { name: 'dbg' });
+        expect(cfg.model).toBe('profile-model');
+      } finally {
+        logger.setConsoleStream(process.stdout);
+        delete process.env.CODEMIE_MODEL;
+      }
+
+      const line = '[ConfigLoader] Profile protection: filtered environment vars: model';
+      expect(captured).toContain(line);
+      const stdoutText = stdoutSpy.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(stdoutText).not.toContain(line);
     });
   });
 });

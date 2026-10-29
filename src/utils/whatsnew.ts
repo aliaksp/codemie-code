@@ -100,8 +100,8 @@ export function getChangelogPath(): string | null {
  *
  * @param version - When given, the entry for this exact version; if there is
  *   no matching heading, falls back to the newest versioned entry (or
- *   Unreleased when that is all there is) so the once-per-upgrade notice
- *   always has something to show
+ *   Unreleased when that is all there is) so `codemie whatsnew` always has
+ *   something to show
  * @returns Parsed entries (newest first, as written), or an empty array when
  *   the changelog is missing or unparseable
  */
@@ -127,8 +127,7 @@ export function getReleaseNotes(version?: string): ReleaseEntry[] {
     }
 
     // No heading for this exact version (changelog not updated for the
-    // release) — fall back to the newest versioned entry so the once-per-
-    // upgrade notice still shows something before the version is marked seen.
+    // release) — fall back to the newest versioned entry.
     const fallback = entries.find(entry => entry.version !== 'Unreleased') ?? entries[0];
     if (fallback) {
       logger.debug(`[whatsnew] No changelog entry for ${version} — falling back to ${fallback.version}`);

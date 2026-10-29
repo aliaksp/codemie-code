@@ -1,6 +1,7 @@
-import chalk from 'chalk';
+import { Console } from 'node:console';
 import * as fs from 'fs';
 import * as path from 'path';
+import chalk from 'chalk';
 import { sanitizeLogArgs } from './security.js';
 import { getCodemiePath } from './paths.js';
 
@@ -28,8 +29,18 @@ class Logger {
   private writeStream: fs.WriteStream | null = null;
   private currentLogDate: string | null = null;
   private isRotating: boolean = false;
+  private consoleSink: Console = console;
 
   constructor() {}
+
+  /**
+   * Send every console-bound level (success, status, notice, debug, error in debug mode)
+   * to one stream, e.g. stderr in a process whose stdout is a protocol channel.
+   * The file sink is unaffected.
+   */
+  setConsoleStream(stream: NodeJS.WritableStream): void {
+    this.consoleSink = new Console(stream, stream);
+  }
 
   /**
    * Set agent name for log formatting
@@ -305,7 +316,7 @@ class Logger {
         prefix += ` [${this.profileName}]`;
       }
 
-      console.log(chalk.dim(`${prefix} ${message}`), ...args);
+      this.consoleSink.error(chalk.dim(`${prefix} ${message}`), ...args);
     }
   }
 
@@ -315,7 +326,12 @@ class Logger {
   }
 
   success(message: string, ...args: unknown[]): void {
-    console.log(chalk.green(`✓ ${message}`), ...args);
+    this.consoleSink.log(chalk.green(`✓ ${message}`), ...args);
+  }
+
+  /** A plain console status line: no prefix, no log-file write. */
+  status(message: string): void {
+    this.consoleSink.log(message);
   }
 
   warn(message: string, ...args: unknown[]): void {
@@ -341,15 +357,15 @@ class Logger {
 
     if (this.isDebugMode()) {
         // Console output
-        console.error(chalk.red(`✗ ${message}`));
+        this.consoleSink.error(chalk.red(`✗ ${message}`));
         if (error) {
             if (error instanceof Error) {
-                console.error(chalk.red(error.message));
+                this.consoleSink.error(chalk.red(error.message));
                 if (error.stack) {
-                    console.error(chalk.white(error.stack));
+                    this.consoleSink.error(chalk.white(error.stack));
                 }
             } else {
-                console.error(chalk.red(String(error)));
+                this.consoleSink.error(chalk.red(String(error)));
             }
         }
     }
@@ -364,7 +380,7 @@ class Logger {
     const logPath = this.getLogFilePath();
     const suffix = logPath ? ` (see ${logPath})` : '';
     const sanitizedArgs = sanitizeLogArgs(...args);
-    console.warn(chalk.yellow(`⚠ ${message}${suffix}`), ...sanitizedArgs);
+    this.consoleSink.warn(chalk.yellow(`⚠ ${message}${suffix}`), ...sanitizedArgs);
   }
 }
 

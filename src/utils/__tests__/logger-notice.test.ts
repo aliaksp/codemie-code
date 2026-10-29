@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises';
 import { mkdtemp } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { Console } from 'node:console';
 import { logger } from '../logger.js';
 
 const ORIGINAL_CODEMIE_HOME = process.env.CODEMIE_HOME;
@@ -46,5 +47,101 @@ describe('Logger.notice', () => {
     expect(logPath).not.toBeNull();
     const contents = await waitForLogContent(logPath!, 'plugin hooks.json malformed');
     expect(contents).toContain('[NOTICE]');
+  });
+});
+
+describe('Logger console sinks', () => {
+  beforeEach(async () => {
+    process.env.CODEMIE_HOME = await mkdtemp(join(tmpdir(), 'codemie-logger-sinks-'));
+    delete process.env.CODEMIE_DEBUG;
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_CODEMIE_HOME === undefined) delete process.env.CODEMIE_HOME;
+    else process.env.CODEMIE_HOME = ORIGINAL_CODEMIE_HOME;
+    if (ORIGINAL_DEBUG === undefined) delete process.env.CODEMIE_DEBUG;
+    else process.env.CODEMIE_DEBUG = ORIGINAL_DEBUG;
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A fresh logger whose default sink is a real Node console on process.stdout / process.stderr
+   * (vitest's own console does not write to them), plus spies on both streams.
+   */
+  async function freshLoggerWithStreamSpies() {
+    const stdoutWrite = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.stubGlobal('console', new Console(process.stdout, process.stderr));
+    vi.resetModules();
+    const { logger: fresh } = await import('../logger.js');
+    vi.unstubAllGlobals();
+    const text = (spy: typeof stdoutWrite) => spy.mock.calls.map(([chunk]) => String(chunk)).join('');
+    return { fresh, stdoutWrite, stderrWrite, stdout: () => text(stdoutWrite), stderr: () => text(stderrWrite) };
+  }
+
+  it('writes debug output to stderr, never stdout, when CODEMIE_DEBUG is set', async () => {
+    process.env.CODEMIE_DEBUG = '1';
+    const { fresh, stdoutWrite, stderr } = await freshLoggerWithStreamSpies();
+    fresh.debug('x');
+    expect(stdoutWrite).not.toHaveBeenCalled();
+    expect(stderr()).toContain('[DEBUG]');
+    expect(stderr()).toContain('x');
+  });
+
+  it('writes debug output nowhere when CODEMIE_DEBUG is unset', async () => {
+    const { fresh, stdoutWrite, stderrWrite } = await freshLoggerWithStreamSpies();
+    fresh.debug('x');
+    expect(stdoutWrite).not.toHaveBeenCalled();
+    expect(stderrWrite).not.toHaveBeenCalled();
+  });
+
+  it('writes success to stdout by default', async () => {
+    const { fresh, stderrWrite, stdout } = await freshLoggerWithStreamSpies();
+    fresh.success('y');
+    expect(stderrWrite).not.toHaveBeenCalled();
+    expect(stdout()).toContain('✓ y');
+  });
+
+  it('writes a status line as is to stdout by default, and nothing to the log file', async () => {
+    const { fresh, stderrWrite, stdout } = await freshLoggerWithStreamSpies();
+    fresh.status('m');
+    expect(stdout()).toBe('m\n');
+    expect(stderrWrite).not.toHaveBeenCalled();
+
+    fresh.info('after-status');
+    const contents = await waitForLogContent(fresh.getLogFilePath()!, 'after-status');
+    // A fresh CODEMIE_HOME: the only file entry is the info line written after the status.
+    expect(contents.trimEnd().split('\n')).toHaveLength(1);
+    expect(contents.trimEnd().endsWith(' after-status')).toBe(true);
+  });
+
+  it('writes a status line as is to the stream given to setConsoleStream', async () => {
+    const { fresh, stdoutWrite, stderr } = await freshLoggerWithStreamSpies();
+    fresh.setConsoleStream(process.stderr);
+    fresh.status('m');
+    expect(stderr()).toBe('m\n');
+    expect(stdoutWrite).not.toHaveBeenCalled();
+  });
+
+  it('sends success, notice and debug to the stream given to setConsoleStream', async () => {
+    vi.resetModules();
+    const { logger: fresh } = await import('../logger.js');
+    process.env.CODEMIE_DEBUG = '1';
+    const stdoutWrite = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    fresh.setConsoleStream(process.stderr);
+    fresh.success('y');
+    fresh.notice('n');
+    fresh.debug('dbg-line');
+
+    const written = stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join('');
+    expect(written).toContain('✓ y');
+    expect(written).toContain('⚠ n');
+    expect(written).toContain('[DEBUG]');
+    expect(written).toContain('dbg-line');
+    expect(stdoutWrite).not.toHaveBeenCalled();
+    expect(consoleLog).not.toHaveBeenCalled();
   });
 });
