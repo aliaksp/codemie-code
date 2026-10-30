@@ -97,6 +97,8 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
 
   function cliEnv(home: string, extraEnv: Record<string, string>): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
+    // lint-staged sets NO_COLOR; with vitest's FORCE_COLOR Node would warn on the child's stderr
+    delete env.NO_COLOR;
     for (const key of Object.keys(env)) {
       if (key.startsWith('CODEMIE_') || key.startsWith('VITEST') || key.toLowerCase().startsWith('npm_config_')) {
         delete env[key];
@@ -237,7 +239,7 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
 
     // Notification is forwarded as is: the SSO gate (and its browser sign-in) runs only on UserPromptSubmit.
     // The profile's baseUrl is a test-only URL with no stored SSO credentials, so the spawned daemon cannot start.
-    it('a status line printed while starting the proxy goes to stderr, not to stdout', async () => {
+    it('starting the proxy writes nothing to stdout or stderr; the cold start is in the file log', async () => {
       const home = freshHome();
       daemonHomes.push(home);
       writeFileSync(
@@ -265,32 +267,46 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
         notification_type: 'idle_prompt',
       });
 
-      const res = await run(home, ['hook', '--agent', 'claude-code-otlp'], notification);
+      const res = await run(home, ['hook', '--agent', 'claude-code-otlp'], notification, { CODEMIE_DEBUG: '1' });
 
       expect(res.stdout).toBe('');
-      expect(res.stderr).toContain('Starting proxy...');
+      expect(res.stderr).toBe('');
+      expect(fileLog(home)).toContain('[daemon-manager] Spawning daemon');
       expect(existsSync(join(home, 'sso-login.lock'))).toBe(false);
       expect(await portHeld(DAEMON_PORT)).toBe(portHeldBefore);
     });
   });
 
-  it('with CODEMIE_DEBUG=1 the hook keeps stdout empty and prints its debug lines on stderr', async () => {
+  it('with CODEMIE_DEBUG=1 the hook keeps stdout and stderr empty and writes its debug lines to the file log', async () => {
     const home = freshHome();
     const res = await run(home, ['hook'], sessionStart(home), { CODEMIE_DEBUG: '1' });
     expect(res.stdout).toBe('');
-    expect(res.stderr).toContain('[DEBUG]');
+    expect(res.stderr).toBe('');
+    expect(fileLog(home)).toContain('[hook] Received input');
   });
 
-  it('a failing migration inside a hook stays off stdout, is logged to the file, and the event is still processed', async () => {
+  it('with CODEMIE_DEBUG=1 invalid JSON exits 2 with only the hook\'s own message on stderr', async () => {
+    const home = freshHome();
+    const res = await run(home, ['hook'], '{not json', { CODEMIE_DEBUG: '1' });
+    expect(res.code).toBe(2);
+    expect(res.stdout).toBe('');
+    const lines = res.stderr.trimEnd().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].startsWith('codemie hook: failed to parse hook input JSON')).toBe(true);
+  });
+
+  it('a failing migration inside a hook stays off stdout and stderr, is logged to the file, and the event is still processed', async () => {
     const warm = await warmHome();
     const control = await run(warm, ['hook'], sessionStart(warm));
     const home = freshHome();
     // An unparseable legacy config makes migration 001 fail.
     writeFileSync(join(home, 'config.json'), '{ not json', 'utf-8');
 
-    const res = await run(home, ['hook'], sessionStart(home));
+    // CODEMIE_DEBUG: the failure's logger.error then has a console copy that must stay off stderr too.
+    const res = await run(home, ['hook'], sessionStart(home), { CODEMIE_DEBUG: '1' });
 
     expect(res.stdout).toBe('');
+    expect(res.stderr).toBe('');
     expect(res.code).toBe(control.code);
     expect(fileLog(home)).toContain('Migration 001-config-rename failed');
     expect(fileLog(warm)).toContain(PROCESSED);

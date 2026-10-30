@@ -1,4 +1,5 @@
 import { Console } from 'node:console';
+import { Writable } from 'node:stream';
 import * as fs from 'fs';
 import * as path from 'path';
 import chalk from 'chalk';
@@ -36,10 +37,18 @@ class Logger {
   /**
    * Send every console-bound level (success, status, notice, debug, error in debug mode)
    * to one stream, e.g. stderr in a process whose stdout is a protocol channel.
-   * The file sink is unaffected.
+   * `null` drops console output entirely, e.g. in a process whose stdout and stderr both
+   * belong to another program. The file sink is unaffected.
    */
-  setConsoleStream(stream: NodeJS.WritableStream): void {
-    this.consoleSink = new Console(stream, stream);
+  setConsoleStream(stream: NodeJS.WritableStream | null): void {
+    const target =
+      stream ??
+      new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        }
+      });
+    this.consoleSink = new Console(target, target);
   }
 
   /**

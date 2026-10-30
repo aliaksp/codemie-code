@@ -144,4 +144,28 @@ describe('Logger console sinks', () => {
     expect(stdoutWrite).not.toHaveBeenCalled();
     expect(consoleLog).not.toHaveBeenCalled();
   });
+
+  it('writes nothing to any console after setConsoleStream(null), and the file sink still receives every level it records', async () => {
+    process.env.CODEMIE_DEBUG = '1';
+    const { fresh, stdoutWrite, stderrWrite } = await freshLoggerWithStreamSpies();
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    fresh.setConsoleStream(null);
+    fresh.debug('null-debug');
+    fresh.success('null-success');
+    fresh.status('null-status');
+    fresh.notice('null-notice');
+    fresh.error('null-error', new Error('e'));
+
+    expect(stdoutWrite).not.toHaveBeenCalled();
+    expect(stderrWrite).not.toHaveBeenCalled();
+    expect(consoleLog).not.toHaveBeenCalled();
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(consoleWarn).not.toHaveBeenCalled();
+    const contents = await waitForLogContent(fresh.getLogFilePath()!, 'null-error');
+    expect(contents).toContain('null-debug');
+    expect(contents).toContain('null-notice');
+  });
 });

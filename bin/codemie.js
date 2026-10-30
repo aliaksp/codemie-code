@@ -5,8 +5,6 @@
  * Entry point for the codemie executable
  */
 
-import { MigrationRunner } from '../dist/migrations/index.js';
-import { checkAndPromptForUpdate } from '../dist/utils/cli-updater.js';
 import { logger } from '../dist/utils/logger.js';
 
 // Tolerate EPIPE when stdout/stderr is piped into a consumer that closes early
@@ -22,10 +20,16 @@ for (const stream of [process.stdout, process.stderr]) {
 // A process an agent runs as a hook: its stdout is the agent's protocol channel
 // (Claude Code adds a hook's stdout to the model's context), so start-up output
 // stays off it, and no update check or prompt runs inside the agent's hook.
+// The agent also reads a hook's stderr on a blocking exit as the block reason,
+// so the logger never writes to the console there: the log file only.
 const isHookProcess = process.argv[2] === 'hook' || process.argv[2] === 'sound';
 if (isHookProcess) {
-  logger.setConsoleStream(process.stderr);
+  logger.setConsoleStream(null);
 }
+
+// Imported after the console switch: their module graph logs at import time.
+const { MigrationRunner } = await import('../dist/migrations/index.js');
+const { checkAndPromptForUpdate } = await import('../dist/utils/cli-updater.js');
 
 // Auto-run pending migrations (happens at startup)
 // Migrations are tracked in ~/.codemie/migrations.json and only run once
@@ -37,7 +41,11 @@ try {
   }
 } catch (error) {
   // Don't block CLI if migration fails
-  console.error('Warning: Migration failed:', error.message);
+  if (isHookProcess) {
+    logger.warn('Warning: Migration failed:', error.message);
+  } else {
+    console.error('Warning: Migration failed:', error.message);
+  }
 }
 
 // Check for CLI updates (silent by default, configurable via CODEMIE_AUTO_UPDATE)

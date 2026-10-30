@@ -127,7 +127,7 @@ logger.debug(JSON.stringify(request)); // ❌ No sanitization
 - ❌ Log in performance-critical paths
 
 **Log File Location**: `~/.codemie/logs/debug-YYYY-MM-DD.log`
-**Debug Mode**: Set `CODEMIE_DEBUG=true` to see debug logs on stderr (every process; a hook process sends its status output there too)
+**Debug Mode**: Set `CODEMIE_DEBUG=true` to see debug logs on stderr (a hook process writes every log level to the log file only; its stderr carries only its own message to the agent on a blocking exit)
 
 ---
 

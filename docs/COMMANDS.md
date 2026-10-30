@@ -1267,7 +1267,7 @@ export CODEMIE_AUTO_UPDATE=true
 codemie --version
 ```
 
-A process an agent runs as a hook (`codemie hook`, `codemie sound`) never checks for updates: it runs pending migrations silently (file log only), shows no what's-new notice, and sends its debug and status output to stderr, so its stdout carries only its answer to the agent. The next interactive `codemie` run checks and updates.
+A process an agent runs as a hook (`codemie hook`, `codemie sound`) never checks for updates: it runs pending migrations silently (file log only), shows no what's-new notice, and writes its debug and status output to the log file only, so its stdout carries only its answer to the agent and its stderr only its own message on a blocking exit. The next interactive `codemie` run checks and updates.
 
 **Performance & Rate Limiting:**
 - Update checks are rate-limited to once per 24 hours by default
