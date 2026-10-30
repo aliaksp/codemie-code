@@ -56,16 +56,7 @@ import {
   type ReconcilePass,
 } from './session/stale-session-reconciliation.js';
 import { noticeDeliveryAtExit } from './session/exit-notice.js';
-
-/**
- * The wrapper's exit budget for network work: the start pass still running, the plugin's session
- * end, the own-record step and the proxy's final sync share it; a request in flight at its end is
- * aborted and what is left stays undelivered for the next start.
- */
-export const EXIT_NETWORK_BUDGET_MS = 10_000;
-
-/** The start pass's share of the exit budget: a pass still running then is abandoned, the rest is left to the own session. */
-const START_PASS_EXIT_BUDGET_MS = EXIT_NETWORK_BUDGET_MS / 2;
+import { EXIT_NETWORK_BUDGET_MS, START_PASS_EXIT_BUDGET_MS, settleStartPass } from './session/start-pass.js';
 
 /**
  * Base class for all agent adapters
@@ -1022,26 +1013,10 @@ export abstract class BaseAgentAdapter implements AgentAdapter {
     }
   }
 
-  /**
-   * Await the start pass until `deadlineMs`; a pass still running then is abandoned (its record in
-   * hand keeps no attempt it did not spend, the rest waits for the next start).
-   */
   private async settleStartPass(deadlineMs: number): Promise<void> {
     const pass = this.startPass;
-    if (!pass) return;
     this.startPass = null;
-    let timer: NodeJS.Timeout | undefined;
-    const timedOut = await Promise.race([
-      pass.done.then(() => false),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(true), Math.max(0, deadlineMs - Date.now()));
-      }),
-    ]);
-    clearTimeout(timer);
-    if (timedOut) {
-      logger.info(`[${this.displayName}] Start pass still running at the exit deadline; abandoned`);
-      await pass.abandon();
-    }
+    if (pass) await settleStartPass(pass, deadlineMs, this.displayName);
   }
 
   /**

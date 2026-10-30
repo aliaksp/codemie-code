@@ -23,6 +23,7 @@ import { getSessionConversationPath, getSessionMetricsPath, getSessionPath } fro
 import { latestRecordTime } from './BaseSessionAdapter.js';
 import { syntheticSessionEnd } from './synthetic-session-end.js';
 import { nextRecordStart, SESSION_UUID_PATTERN } from './next-record-start.js';
+import { EXIT_NETWORK_BUDGET_MS } from './start-pass.js';
 import { getCodemiePath } from '@/utils/paths.js';
 import { logger } from '@/utils/logger.js';
 import { acquirePidLock } from '@/utils/pid-lock.js';
@@ -85,8 +86,8 @@ async function loadHookPipeline(overrides?: Partial<HookPipeline>): Promise<Hook
   const hook = await import('@/cli/commands/hook.js');
   return {
     processEvent: overrides?.processEvent ?? (hook.processEvent as ProcessEventFn),
-    deliverSession: overrides?.deliverSession ?? hook.deliverSession,
-    renameSessionFiles: overrides?.renameSessionFiles ?? hook.renameSessionFiles,
+    deliverSession: overrides?.deliverSession ?? (await import('@/cli/commands/hook/delivery.js')).deliverSession,
+    renameSessionFiles: overrides?.renameSessionFiles ?? (await import('./session-generation.js')).renameSessionFiles,
   };
 }
 
@@ -424,7 +425,6 @@ export function reconcileOtherSessions(ctx: ReconcileContext): ReconcilePass {
 
   const run = async (): Promise<void> => {
     const pipeline = await loadHookPipeline(ctx.pipeline);
-    const { EXIT_NETWORK_BUDGET_MS } = await import('../BaseAgentAdapter.js');
     const candidates = await listCandidates(ctx.env, ctx.ownSessionId);
     if (candidates.length > 0) {
       logger.info(`[reconcile] ${candidates.length} record(s) to finalize or deliver`);

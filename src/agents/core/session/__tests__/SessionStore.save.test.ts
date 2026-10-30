@@ -170,6 +170,31 @@ describe('SessionStore.saveSession', () => {
     expect(JSON.parse(readFileSync(completedPath(), 'utf-8')).deliveryAttempts).toBe(3);
   });
 
+  it('leaves a newer generation\'s {id}.json written after the completed_ merge in place', async () => {
+    writeFileSync(livePath(), JSON.stringify(makeSession()));
+    await renameToCompletedDuringWrite(
+      makeSession({ status: 'completed', reason: 'stop', endMetricSentAt: 1_790_000_300_000 })
+    );
+    const newer = JSON.stringify(makeSession({
+      startTime: 1_790_000_900_000,
+      correlation: { status: 'matched', agentSessionId: 'native-2', retryCount: 0 },
+    }));
+    const actualRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename;
+    // A /clear SessionStart writes the fresh generation's {id}.json right after the merge lands in completed_.
+    vi.mocked(rename).mockImplementationOnce(async (from, to) => {
+      await actualRename(from, to);
+      writeFileSync(livePath(), newer);
+    });
+    const { SessionStore } = await import('../SessionStore.js');
+
+    await new SessionStore().saveSession(makeSession({ status: 'completed', reason: 'exit' }));
+
+    expect(readFileSync(livePath(), 'utf-8')).toBe(newer);
+    const completed = JSON.parse(readFileSync(completedPath(), 'utf-8'));
+    expect(completed.reason).toBe('exit');
+    expect(completed.endMetricSentAt).toBe(1_790_000_300_000);
+  });
+
   it('writes {id}.json for a completed record while {id}.json exists', async () => {
     writeFileSync(livePath(), JSON.stringify(makeSession()));
     writeFileSync(completedPath(), JSON.stringify(makeSession({ status: 'completed', reason: 'older' })));

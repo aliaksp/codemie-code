@@ -52,6 +52,10 @@ function mergeCompleted(saving: Session, other: Session): Session {
   };
 }
 
+function sameGeneration(a: Session, b: Session): boolean {
+  return a.startTime === b.startTime && a.correlation?.agentSessionId === b.correlation?.agentSessionId;
+}
+
 export class SessionStore {
   /**
    * Save session to disk, atomically (a temp file renamed over the target).
@@ -108,7 +112,7 @@ export class SessionStore {
       ) {
         const other = JSON.parse(await readFile(completedPath, 'utf-8')) as Session;
         await writeAtomic(completedPath, mergeCompleted(session, other));
-        await rm(livePath, { force: true });
+        await this.removeIfSameGeneration(livePath, session);
         logger.info(`[SessionStore] Merged ${session.sessionId}.json into its generation completed meanwhile`);
         return;
       }
@@ -129,10 +133,23 @@ export class SessionStore {
       logger.warn(`[SessionStore] Unreadable ${basename(completedPath)}; saving ${session.sessionId}.json`, error);
       return false;
     }
-    return (
-      completed.startTime === session.startTime &&
-      completed.correlation?.agentSessionId === session.correlation?.agentSessionId
-    );
+    return sameGeneration(completed, session);
+  }
+
+  /** A newer generation (a `/clear` start) may have written `{id}.json` since this save; that record stays. */
+  private async removeIfSameGeneration(livePath: string, session: Session): Promise<void> {
+    let live: Session;
+    try {
+      live = JSON.parse(await readFile(livePath, 'utf-8')) as Session;
+    } catch (error) {
+      logger.debug(`[SessionStore] Leaving ${basename(livePath)} in place: unreadable after the merge`, error);
+      return;
+    }
+    if (!sameGeneration(live, session)) {
+      logger.debug(`[SessionStore] Leaving ${basename(livePath)} in place: a different generation wrote it meanwhile`);
+      return;
+    }
+    await rm(livePath, { force: true });
   }
 
   /**

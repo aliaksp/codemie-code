@@ -1,28 +1,26 @@
 import { Command } from 'commander';
-import { existsSync } from 'fs';
-import { appendFile, readFile, rename, unlink } from 'fs/promises';
-import { basename, dirname, join } from 'path';
 import { logger } from '@/utils/logger.js';
 import { AgentRegistry } from '@/agents/registry.js';
-import { getSessionPath, getSessionMetricsPath, getSessionConversationPath } from '@/agents/core/session/session-config.js';
 import { SESSION_ORIGIN, SESSION_ORIGIN_ENV_KEY } from '@/agents/core/session/types.js';
 import type { BaseHookEvent, HookTransformer, MCPConfigSummary, ExtensionsScanSummary } from '@/agents/core/types.js';
-import type { ProcessingContext } from '@/agents/core/session/BaseProcessor.js';
-import type { SessionStore } from '@/agents/core/session/SessionStore.js';
 import { ensureOtlpProxy } from './proxy/connect-orchestrator.js';
 import { forwardOtlpEventsToSpool } from '@/agents/plugins/utils.js';
 import { ensureCodeMieSsoAuth, ensureCodeMieSsoAuthOrWait, type AuthGateInput } from '@/providers/plugins/sso/sso.auth-gate.js';
 import { describeLogin } from '@/providers/plugins/sso/sso.detached-login.js';
 import {
-  EXIT_DEADLINE_ENV,
   markDroppedIfUndelivered,
   maxDeltaTimestamp,
   readLiveRecord,
   reconcileLockPath,
 } from '@/agents/core/session/stale-session-reconciliation.js';
-import { hasSendPath, sameHost, sendPathApiUrl } from '@/agents/core/session/send-path.js';
+import { sameHost } from '@/agents/core/session/send-path.js';
 import { syntheticSessionEnd } from '@/agents/core/session/synthetic-session-end.js';
 import { nextRecordStart } from '@/agents/core/session/next-record-start.js';
+import { moveSetToGeneration } from '@/agents/core/session/session-generation.js';
+import { configSendPathApiUrl, getConfigValue } from './hook/config-value.js';
+import { sessionEndOptions, type SessionEndOptions } from './hook/session-end-options.js';
+import { buildProcessingContext } from './hook/processing-context.js';
+import { deliverSessionRecord, liveWrapperDelivering, nativeSessionId } from './hook/delivery.js';
 
 /**
  * Hook event handlers for agent lifecycle events
@@ -114,29 +112,6 @@ export interface HookProcessingConfig {
 /** How long `/clear` may spend delivering the generation it closes before moving it aside. */
 export const CLEAR_DELIVERY_BUDGET_MS = 2_000;
 
-/** The bounds and mode of one SessionEnd. */
-interface SessionEndOptions {
-  /** True only inside a `codemie hook` process */
-  hookProcess?: boolean;
-  abortSignal?: AbortSignal;
-  /** Set → no 2 s sync budget; the network work stops at this epoch ms */
-  deadlineMs?: number;
-  holdsReconcileLock?: boolean;
-  localOnly?: boolean;
-}
-
-function sessionEndOptions(config?: HookProcessingConfig, abortSignal?: AbortSignal, hookProcess = false): SessionEndOptions {
-  if (!config) return { hookProcess, abortSignal };
-  const envDeadline = Number(config.env?.[EXIT_DEADLINE_ENV]);
-  return {
-    hookProcess,
-    abortSignal: config.abortSignal ?? abortSignal,
-    deadlineMs: config.deadlineMs ?? (Number.isFinite(envDeadline) && envDeadline > 0 ? envDeadline : undefined),
-    holdsReconcileLock: config.holdsReconcileLock,
-    localOnly: config.localOnly,
-  };
-}
-
 /**
  * Read JSON from stdin
  */
@@ -166,36 +141,6 @@ export function injectEventName(raw: string, eventName: string): string {
   } catch {
     return raw;
   }
-}
-
-/**
- * Helper function to get configuration value from config object or environment variable
- * @param envKey - Environment variable key (e.g., 'CODEMIE_AGENT')
- * @param config - Optional config object
- * @returns Configuration value or undefined
- */
-function getConfigValue(envKey: string, config?: HookProcessingConfig): string | undefined {
-  if (config) {
-    // Map environment variable keys to config properties
-    const configMap: Record<string, keyof HookProcessingConfig> = {
-      'CODEMIE_AGENT': 'agentName',
-      'CODEMIE_PROVIDER': 'provider',
-      'CODEMIE_BASE_URL': 'apiBaseUrl',
-      'CODEMIE_API_KEY': 'apiKey',
-      'CODEMIE_CLIENT_TYPE': 'clientType',
-      'CODEMIE_CLI_VERSION': 'version',
-      'CODEMIE_PROFILE_NAME': 'profileName',
-      'CODEMIE_PROJECT': 'project',
-      'CODEMIE_MODEL': 'model',
-      'CODEMIE_URL': 'ssoUrl',
-      'CODEMIE_SYNC_API_URL': 'syncApiUrl',
-    };
-    const configKey = configMap[envKey];
-    if (configKey) {
-      return config[configKey] as string | undefined;
-    }
-  }
-  return process.env[envKey];
 }
 
 /**
@@ -343,21 +288,6 @@ async function handleSessionEnd(event: SessionEndEvent, sessionId: string, confi
   }
 }
 
-/** Reasons after which the wrapper exits with the agent, so its exit step delivers the record. */
-const WRAPPER_EXIT_REASONS = new Set(['prompt_input_exit', 'logout']);
-
-/**
- * The pid of the live wrapper that delivers this record at its exit, else undefined.
- * The wrapper's exit step delivers only with a send path, so without one the hook delivers.
- * Pid-only liveness: a `ps` start-time check would spend the agent's ~1 s SessionEnd budget.
- */
-async function liveWrapperDelivering(reason: string | undefined, config: HookProcessingConfig | undefined): Promise<number | undefined> {
-  if (!reason || !WRAPPER_EXIT_REASONS.has(reason) || !syncApplies(config) || !hasSendPath(process.env)) return undefined;
-  const { WRAPPER_PID_ENV, isProcessAlive } = await import('../../utils/processes.js');
-  const pid = Number(process.env[WRAPPER_PID_ENV]);
-  return Number.isInteger(pid) && pid > 0 && isProcessAlive(pid) ? pid : undefined;
-}
-
 /**
  * Close a live record: flush the transcript, mark it completed with its end time.
  *
@@ -398,183 +328,6 @@ async function finalizeSession(event: SessionEndEvent, sessionId: string, config
   );
   await accumulateActiveDuration(sessionId, endTime);
   await updateSessionStatus(event, sessionId, endTime);
-}
-
-/**
- * Deliver a completed record: its end metric (once: never after `endMetricSentAt`), then
- * its pending data, then the `completed_` rename when delivery is done. The caller holds the
- * session's reconcile lock.
- */
-async function deliverSessionRecord(
-  sessionId: string,
-  agentSessionId: string,
-  reason: string | undefined,
-  config: HookProcessingConfig | undefined,
-  options: SessionEndOptions
-): Promise<void> {
-  // 3. Send session end metrics (only reads the session file, which still exists —
-  //    the rename stays last)
-  await sendSessionEndMetrics(sessionId, agentSessionId, reason, config, options);
-
-  // 4. API SYNC: Sync pending data to API using SessionSyncer (deadline-bounded,
-  //    abortable; unfinished work stays pending)
-  await syncPendingDataToAPI(sessionId, agentSessionId, config, options);
-
-  // 5. Rename files LAST, and only once delivered
-  if (await isDeliveryDone(sessionId, config)) {
-    // A line past its sync-attempt cap counts as done: it leaves the queue unsent
-    if (syncApplies(config)) await markDroppedIfUndelivered(sessionId);
-    await renameSessionFiles(sessionId);
-  } else {
-    logger.info(`[hook:SessionEnd] Session ${sessionId} is not fully delivered yet; kept as ${sessionId}.json for a later run`);
-  }
-}
-
-/**
- * Deliver a completed `{id}.json` record now (end metric, pending data, rename when done).
- * The caller holds the session's reconcile lock.
- */
-export async function deliverSession(sessionId: string, config: HookProcessingConfig): Promise<void> {
-  const { SessionStore } = await import('../../agents/core/session/SessionStore.js');
-  const record = await new SessionStore().loadSession(sessionId);
-  if (!record) {
-    logger.warn(`[hook] Session not found for delivery: ${sessionId}`);
-    return;
-  }
-  const options = { ...sessionEndOptions(config), holdsReconcileLock: true };
-  await logger.runWithContext(
-    { agentName: config.agentName, sessionId: config.sessionId, profileName: config.profileName },
-    () => deliverSessionRecord(sessionId, nativeSessionId(record), record.reason, config, options)
-  );
-}
-
-/** The agent's own session id of a record, else its CodeMie id. */
-function nativeSessionId(record: { sessionId: string; correlation?: { agentSessionId?: string } }): string {
-  const agentSessionId = record.correlation?.agentSessionId;
-  return agentSessionId && agentSessionId !== 'unknown' ? agentSessionId : record.sessionId;
-}
-
-/** Whether the sync of pending data applies to this launch (CodeMie analytics auth configured). */
-function syncApplies(config?: HookProcessingConfig): boolean {
-  const provider = getConfigValue('CODEMIE_PROVIDER', config);
-  const ssoUrl = getConfigValue('CODEMIE_URL', config);
-  const syncApiUrl = getConfigValue('CODEMIE_SYNC_API_URL', config);
-  return provider === 'ai-run-sso' || Boolean(ssoUrl && syncApiUrl);
-}
-
-/** The API a request with SSO credentials goes to: the launch's send path, else undefined. */
-function configSendPathApiUrl(config?: HookProcessingConfig): string | undefined {
-  return sendPathApiUrl({
-    CODEMIE_URL: getConfigValue('CODEMIE_URL', config),
-    CODEMIE_SYNC_API_URL: getConfigValue('CODEMIE_SYNC_API_URL', config),
-    CODEMIE_BASE_URL: getConfigValue('CODEMIE_BASE_URL', config),
-    CODEMIE_TARGET_API_URL: (config?.env ?? process.env).CODEMIE_TARGET_API_URL,
-  });
-}
-
-/**
- * Delivery is done when the end metric is sent or does not apply, and — for a matched
- * record whose sync applies — no metric line is pending / retryable and no conversation
- * payload is waiting.
- */
-async function isDeliveryDone(sessionId: string, config?: HookProcessingConfig): Promise<boolean> {
-  const { SessionStore } = await import('../../agents/core/session/SessionStore.js');
-  const record = await new SessionStore().loadSession(sessionId);
-  if (!record) return false;
-  if (record.endMetricSentAt === undefined && record.endMetricSkipped === undefined) return false;
-  // An unmatched record has no transcript data to sync: not applicable, never a failed delivery
-  if (record.correlation?.status !== 'matched' || !syncApplies(config)) return true;
-
-  try {
-    const { readJSONL } = await import('../../providers/plugins/sso/session/utils/jsonl-reader.js');
-    const { isDeltaSendCandidate } = await import('../../providers/plugins/sso/session/processors/metrics/metrics-sync-processor.js');
-    const deltas = await readJSONL<Parameters<typeof isDeltaSendCandidate>[0]>(getSessionMetricsPath(sessionId));
-    if (deltas.some(isDeltaSendCandidate)) {
-      return false;
-    }
-    const { isSendCandidate } = await import('../../providers/plugins/sso/session/processors/conversations/payload-queue.js');
-    const payloads = await readJSONL<Parameters<typeof isSendCandidate>[0]>(getSessionConversationPath(sessionId));
-    return !payloads.some(isSendCandidate);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logger.warn(`[hook:SessionEnd] Cannot read the pending data of ${sessionId}; kept undelivered: ${msg}`);
-    return false;
-  }
-}
-
-/**
- * Default budget (ms) for the SessionEnd API sync. Claude Code kills the hook
- * process quickly at exit, so the sync must stop sending and defer leftovers
- * instead of blocking teardown.
- * Override via CODEMIE_SESSION_END_SYNC_BUDGET_MS (invalid or non-positive
- * values fall back to this default).
- */
-const DEFAULT_SESSION_END_SYNC_BUDGET_MS = 2000;
-
-function resolveSessionEndSyncBudgetMs(): number {
-  const parsed = Number.parseInt(process.env.CODEMIE_SESSION_END_SYNC_BUDGET_MS ?? '', 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_SESSION_END_SYNC_BUDGET_MS;
-  }
-  return parsed;
-}
-
-/**
- * Sync pending data to API using SessionSyncer
- * Same service used by plugin timer - ensures consistency
- *
- * @param sessionId - CodeMie session ID
- * @param agentSessionId - Agent session ID for context
- * @param config - Optional configuration object (if not provided, reads from environment variables)
- * @param options - The SessionEnd's bounds: a hook process and a caller without bounds get the
- *   2 s budget; an in-process caller with a deadline or abort signal is bounded by those alone
- */
-async function syncPendingDataToAPI(sessionId: string, agentSessionId: string, config: HookProcessingConfig | undefined, options: SessionEndOptions): Promise<void> {
-  try {
-    if (!syncApplies(config)) {
-      logger.debug('[hook:SessionEnd] Skipping API sync (CodeMie analytics auth not configured)');
-      return;
-    }
-
-    logger.info(`[hook:SessionEnd] Syncing pending data to API`);
-
-    // Build processing context
-    const context = await buildProcessingContext(sessionId, agentSessionId, '', config);
-    if (!context.apiBaseUrl) {
-      logger.debug('[hook:SessionEnd] Skipping API sync (no send path: no sync API URL, no started proxy)');
-      return;
-    }
-
-    // Bound the sync. Sync loops check the deadline between items, the clients abort a
-    // request in flight at it; the rest stays pending for a later run.
-    const callerBounded = !options.hookProcess && (options.deadlineMs !== undefined || options.abortSignal !== undefined);
-    const budgetDeadlineMs = Date.now() + resolveSessionEndSyncBudgetMs();
-    context.syncDeadlineMs = callerBounded
-      ? options.deadlineMs
-      : Math.min(budgetDeadlineMs, options.deadlineMs ?? budgetDeadlineMs);
-    context.abortSignal = options.abortSignal;
-    context.hookProcess = options.hookProcess === true;
-
-    // Use SessionSyncer service (same as plugin)
-    const { SessionSyncer } = await import(
-      '../../providers/plugins/sso/session/SessionSyncer.js'
-    );
-    const syncer = new SessionSyncer();
-
-    // Sync pending data
-    const result = await syncer.sync(sessionId, context);
-
-    if (result.success) {
-      logger.info(`[hook:SessionEnd] API sync complete: ${result.message}`);
-    } else {
-      logger.warn(`[hook:SessionEnd] API sync had failures: ${result.message}`);
-    }
-
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logger.error(`[hook:SessionEnd] Failed to sync pending data: ${errorMessage}`);
-    // Don't throw - sync failure should not block session end
-  }
 }
 
 /**
@@ -691,81 +444,6 @@ async function performIncrementalSync(
     // Don't throw - hook should not block agent execution or user prompts
   }
   return lastRecordAt;
-}
-
-/**
- * Build processing context for SessionAdapter
- * @param sessionId - CodeMie session ID
- * @param agentSessionId - Agent session ID
- * @param agentSessionFile - Path to agent session file
- * @param config - Optional configuration object (if not provided, reads from environment variables)
- * @returns Processing context for SessionAdapter
- */
-async function buildProcessingContext(
-  sessionId: string,
-  agentSessionId: string,
-  agentSessionFile: string,
-  config?: HookProcessingConfig
-): Promise<ProcessingContext> {
-  // Get configuration values from config object or environment variables
-  const ssoUrl = getConfigValue('CODEMIE_URL', config);
-  const apiKey = config?.apiKey || getConfigValue('CODEMIE_API_KEY', config);
-  // An API key replaces the SSO cookies on every request, so its URL needs no send path
-  const apiUrl = (apiKey
-    ? getConfigValue('CODEMIE_SYNC_API_URL', config) || getConfigValue('CODEMIE_BASE_URL', config)
-    : configSendPathApiUrl(config)) || '';
-  const cliVersion = getConfigValue('CODEMIE_CLI_VERSION', config) || '0.0.0';
-  const clientType = getConfigValue('CODEMIE_CLIENT_TYPE', config) || 'codemie-cli';
-
-  // Load the CodeMie session metadata so processors can use gitBranch and other
-  // session-level fields that are not present in the native agent transcript.
-  let gitBranch: string | undefined;
-  try {
-    const { getCodemiePath } = await import('../../utils/paths.js');
-    const { readFile } = await import('node:fs/promises');
-    const sessionMeta = JSON.parse(
-      await readFile(getCodemiePath('sessions', `${sessionId}.json`), 'utf-8')
-    ) as { gitBranch?: string };
-    gitBranch = sessionMeta.gitBranch;
-  } catch {
-    // Session metadata may not exist in all contexts (e.g., tests); proceed without it.
-  }
-
-  // Build context with SSO credentials if available
-  let cookies = config?.cookies || '';
-
-  // If CodeMie analytics auth is configured and credentials are not provided,
-  // try to load the stored SSO cookies. This also supports native providers
-  // such as anthropic-subscription, where CodeMie auth is analytics-only.
-  if (ssoUrl && apiUrl && !cookies) {
-    try {
-      const { getStoredAnalyticsCredentials } = await import('../../providers/core/codemie-auth-helpers.js');
-      const credentials = (await getStoredAnalyticsCredentials(ssoUrl, config?.env, {
-        provider: getConfigValue('CODEMIE_PROVIDER', config),
-      }))?.credentials;
-
-      if (credentials?.cookies) {
-        cookies = Object.entries(credentials.cookies)
-          .map(([key, value]) => `${key}=${value}`)
-          .join('; ');
-      }
-    } catch (error) {
-      logger.debug('[hook] Failed to load SSO credentials:', error);
-    }
-  }
-
-  return {
-    apiBaseUrl: apiUrl,
-    cookies,
-    apiKey,
-    clientType,
-    version: cliVersion,
-    dryRun: false,
-    sessionId,
-    agentSessionId,
-    agentSessionFile,
-    gitBranch,
-  };
 }
 
 /**
@@ -1424,135 +1102,6 @@ async function updateSessionStatus(event: SessionEndEvent, sessionId: string, en
   }
 }
 
-/** The three files of a session set under a name prefix (`''` live, `completed_`). */
-function sessionSetFiles(sessionsDir: string, name: string): { json: string; metrics: string; conversation: string } {
-  return {
-    json: join(sessionsDir, `${name}.json`),
-    metrics: join(sessionsDir, `${name}_metrics.jsonl`),
-    conversation: join(sessionsDir, `${name}_conversation.jsonl`),
-  };
-}
-
-/** The generation of a record file: its agent session id, else its start time; undefined when unreadable. */
-async function readGeneration(jsonPath: string): Promise<string | undefined> {
-  try {
-    const record = JSON.parse(await readFile(jsonPath, 'utf-8')) as { startTime?: number; correlation?: { agentSessionId?: string } };
-    const agentSessionId = record.correlation?.agentSessionId;
-    const generation = agentSessionId && agentSessionId !== 'unknown'
-      ? agentSessionId
-      : record.startTime !== undefined ? String(record.startTime) : undefined;
-    return generation?.replace(/[^A-Za-z0-9._-]/g, '_');
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Move a session set (`<prefix><id>.json`, `_metrics.jsonl`, `_conversation.jsonl`) to its
- * generation name `completed_<id>-<generation>*`, `-<n>` appended when that name is taken.
- * A failed rename moves the files already moved back and rethrows: the set never ends half-moved.
- * Returns the new base name, or undefined when there was no set to move.
- */
-async function moveSetToGeneration(sessionId: string, prefix: '' | 'completed_'): Promise<string | undefined> {
-  const sessionsDir = dirname(getSessionPath(sessionId));
-  const from = sessionSetFiles(sessionsDir, `${prefix}${sessionId}`);
-  if (!existsSync(from.json)) return undefined;
-
-  const generation = (await readGeneration(from.json)) ?? 'unknown';
-  let base = `completed_${sessionId}-${generation}`;
-  for (let n = 2; existsSync(join(sessionsDir, `${base}.json`)); n++) {
-    base = `completed_${sessionId}-${generation}-${n}`;
-  }
-  const to = sessionSetFiles(sessionsDir, base);
-  const moved: Array<keyof typeof from> = [];
-  try {
-    // The .json last: a kill mid-move leaves it under its name, and the next close moves the rest to the same generation.
-    for (const key of ['metrics', 'conversation', 'json'] as const) {
-      if (!existsSync(from[key])) continue;
-      if (key !== 'json' && existsSync(to[key])) {
-        // A move cut by a kill left this sidecar there; the lines written since go after it, never over it
-        // Not pushed to `moved`: its source is gone, a rollback must not rename the combined file over it
-        await appendFile(to[key], await readFile(from[key]));
-        await unlink(from[key]);
-      } else {
-        await rename(from[key], to[key]);
-        moved.push(key);
-      }
-    }
-  } catch (error) {
-    for (const key of moved.reverse()) {
-      await rename(to[key], from[key]).catch((undoError: unknown) => {
-        logger.error(`[hook] Could not move ${basename(to[key])} back to ${basename(from[key])}:`, undoError);
-      });
-    }
-    throw error;
-  }
-  logger.info(`[hook] Moved ${prefix}${sessionId} set to generation ${base}`);
-  return base;
-}
-
-/**
- * Rename session files with 'completed_' prefix
- * Uses session-config.ts helpers to ensure consistent paths.
- *
- * Renames:
- * - Session file: {sessionId}.json → completed_{sessionId}.json
- * - Metrics file: {sessionId}_metrics.jsonl → completed_{sessionId}_metrics.jsonl
- * - Conversations file: {sessionId}_conversation.jsonl → completed_{sessionId}_conversation.jsonl
- *
- * Never over another generation: an existing `completed_{sessionId}*` set of another
- * generation (its agent session id, else its start time, differs) is first moved to
- * `completed_{sessionId}-<generation>*`; the same generation is renamed over (a later
- * state of the same record).
- *
- * @param sessionId - The CodeMie session ID
- */
-export async function renameSessionFiles(sessionId: string): Promise<void> {
-  const sessionsDir = dirname(getSessionPath(sessionId));
-  const live = sessionSetFiles(sessionsDir, sessionId);
-  const completed = sessionSetFiles(sessionsDir, `completed_${sessionId}`);
-
-  if (existsSync(live.json) && existsSync(completed.json)) {
-    const [liveGeneration, completedGeneration] = await Promise.all([readGeneration(live.json), readGeneration(completed.json)]);
-    // An unreadable generation is never taken for the same one
-    if (liveGeneration === undefined || liveGeneration !== completedGeneration) {
-      try {
-        await moveSetToGeneration(sessionId, 'completed_');
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger.warn(`[hook:SessionEnd] Failed to move the previous generation aside; not renaming: ${errorMessage}`);
-        return;
-      }
-    }
-    // ponytail: same generation — lines only in the older completed_ files are lost locally (already delivered)
-  }
-
-  const renamedFiles: string[] = [];
-  const errors: string[] = [];
-  for (const [label, key] of [['session', 'json'], ['metrics', 'metrics'], ['conversations', 'conversation']] as const) {
-    try {
-      if (existsSync(live[key])) {
-        await rename(live[key], completed[key]);
-        renamedFiles.push(label);
-        logger.debug(`[hook:SessionEnd] Renamed ${label} file: ${basename(live[key])} → ${basename(completed[key])}`);
-      }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      errors.push(`${label}: ${errorMessage}`);
-      logger.warn(`[hook:SessionEnd] Failed to rename ${label} file: ${errorMessage}`);
-    }
-  }
-
-  // Log summary
-  if (renamedFiles.length > 0) {
-    logger.info(`[hook:SessionEnd] Renamed files: ${renamedFiles.join(', ')}`);
-  }
-
-  if (errors.length > 0) {
-    logger.warn(`[hook:SessionEnd] File rename errors: ${errors.join('; ')}`);
-  }
-}
-
 /**
  * `/clear` (SessionStart `source: clear`) closes the generation it replaces, under the
  * session's reconcile lock (waited for up to the lock helper's 10 s budget: a start pass holding it
@@ -1603,184 +1152,6 @@ async function closeClearedGeneration(sessionId: string, config: HookProcessingC
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error(`[hook:SessionStart] /clear: failed to close the previous generation: ${errorMessage}`);
-  }
-}
-
-/** Saves the end metric's outcome on the latest copy of the record. */
-async function markEndMetric(
-  sessionStore: SessionStore,
-  sessionId: string,
-  outcome: { endMetricSentAt: number } | { endMetricSkipped: string }
-): Promise<void> {
-  const latest = await sessionStore.loadSession(sessionId);
-  if (latest) await sessionStore.saveSession({ ...latest, ...outcome });
-}
-
-/**
- * The cookie header of the end metric: the config's, else the stored SSO credentials. Undefined
- * without credentials, which counts as a failed send, re-delivered later.
- */
-async function endMetricCookieHeader(
-  ssoUrl: string,
-  config: HookProcessingConfig | undefined,
-  abortSignal: AbortSignal | undefined
-): Promise<string | undefined> {
-  let cookieHeader = config?.cookies || '';
-  if (!cookieHeader && ssoUrl) {
-    try {
-      const { getStoredAnalyticsCredentials } = await import('../../providers/core/codemie-auth-helpers.js');
-      const credentials = (await getStoredAnalyticsCredentials(ssoUrl, config?.env, {
-        provider: getConfigValue('CODEMIE_PROVIDER', config),
-      }))?.credentials;
-
-      if (credentials?.cookies) {
-        cookieHeader = Object.entries(credentials.cookies)
-          .map(([key, value]) => `${key}=${value}`)
-          .join('; ');
-      }
-    } catch (error) {
-      logger.debug('[hook:SessionEnd] Failed to load SSO credentials:', error);
-    }
-  }
-
-  if (!cookieHeader) {
-    const { noteSendAttempt } = await import('../../providers/plugins/sso/session/bounded-request.js');
-    noteSendAttempt(abortSignal);
-    logger.info(`[hook:SessionEnd] No SSO credentials found for ${ssoUrl}`);
-    return undefined;
-  }
-  return cookieHeader;
-}
-
-/**
- * Helper: Send session end metrics to CodeMie backend
- * Works for providers that have CodeMie analytics authentication configured
- *
- * The result is kept on the record: a sent metric sets `endMetricSentAt` (never sent again),
- * one that does not apply sets `endMetricSkipped`; a failed send sets neither, so a later
- * run re-delivers it. Inside a hook process it is one request with no retry, stopped by the
- * hook's abort; in-process callers retry within their deadline.
- *
- * @param sessionId - The CodeMie session ID (for file operations)
- * @param agentSessionId - The agent's session ID (for API)
- * @param reason - The session end reason
- * @param config - Optional configuration object (if not provided, reads from environment variables)
- * @param options - The SessionEnd's bounds and mode
- */
-async function sendSessionEndMetrics(
-  sessionId: string,
-  agentSessionId: string,
-  reason: string | undefined,
-  config: HookProcessingConfig | undefined,
-  options: SessionEndOptions
-): Promise<void> {
-  try {
-    // Load session to get start / end time
-    const { SessionStore } = await import('../../agents/core/session/SessionStore.js');
-    const sessionStore = new SessionStore();
-    const session = await sessionStore.loadSession(sessionId);
-
-    if (!session) {
-      logger.warn(`[hook:SessionEnd] Session not found for metrics: ${sessionId}`);
-      return;
-    }
-    if (session.endMetricSentAt !== undefined || session.endMetricSkipped !== undefined) {
-      logger.debug(`[hook:SessionEnd] End metric already ${session.endMetricSentAt !== undefined ? 'sent' : 'skipped'} for ${sessionId}`);
-      return;
-    }
-
-    // Get required configuration values
-    const agentName = getConfigValue('CODEMIE_AGENT', config);
-    const provider = getConfigValue('CODEMIE_PROVIDER', config);
-    const ssoUrl = getConfigValue('CODEMIE_URL', config);
-    const apiUrl = configSendPathApiUrl(config);
-    const cliVersion = getConfigValue('CODEMIE_CLI_VERSION', config);
-    const model = getConfigValue('CODEMIE_MODEL', config);
-    const project = getConfigValue('CODEMIE_PROJECT', config);
-
-    if (!agentName || !ssoUrl) {
-      logger.debug('[hook:SessionEnd] Missing required config for metrics');
-      await markEndMetric(sessionStore, sessionId, { endMetricSkipped: 'no-analytics-config' });
-      return;
-    }
-    if (!apiUrl) {
-      logger.debug('[hook:SessionEnd] No send path (no sync API URL, no started proxy): end metric not sent');
-      await markEndMetric(sessionStore, sessionId, { endMetricSkipped: 'no-send-path' });
-      return;
-    }
-
-    const { isExternalOrigin } = await import('../../agents/core/session/session-origin-audit.js');
-    if (isExternalOrigin(session)) {
-      logger.debug('[hook:SessionEnd] Skipping end metrics for external-resume session');
-      await markEndMetric(sessionStore, sessionId, { endMetricSkipped: 'external-resume' });
-      return;
-    }
-
-    // One end for the record, the metric's duration and its end_time
-    const endTime = session.endTime ?? Date.now();
-    const wallClockDurationMs = endTime - session.startTime;
-    const activeDurationMs = session.activeDurationMs || undefined;
-
-    // Build status object with reason from event
-    // Status is "completed" for normal session endings, with reason from Claude (e.g., "exit", "logout")
-    const status = {
-      status: 'completed' as const,
-      reason
-    };
-
-    const cookieHeader = await endMetricCookieHeader(ssoUrl, config, options.abortSignal);
-    if (!cookieHeader) return;
-
-    // Use MetricsSender to send session end metric
-    const { MetricsSender } = await import(
-      '../../providers/plugins/sso/index.js'
-    );
-
-    const clientType = getConfigValue('CODEMIE_CLIENT_TYPE', config) || 'codemie-cli';
-
-    const sender = new MetricsSender({
-      baseUrl: apiUrl,
-      cookies: cookieHeader,
-      timeout: 10000,
-      retryAttempts: options.hookProcess ? 0 : 2,
-      version: cliVersion,
-      clientType,
-      deadlineMs: options.deadlineMs,
-      abortSignal: options.abortSignal
-    });
-
-    // Send session end metric (use agent session ID for API)
-    await sender.sendSessionEnd(
-      {
-        sessionId: agentSessionId,
-        agentName,
-        provider: provider || 'unknown',
-        project,
-        model,
-        startTime: session.startTime,
-        workingDirectory: session.workingDirectory,
-        ...(session.repository && { repository: session.repository })
-      },
-      session.workingDirectory,
-      status,
-      wallClockDurationMs,
-      undefined, // error parameter - undefined for normal termination
-      activeDurationMs,
-      endTime
-    );
-    // ponytail: a process cut between the server's 200 and this save sends the end metric once more
-    await markEndMetric(sessionStore, sessionId, { endMetricSentAt: Date.now() });
-
-    logger.info('[hook:SessionEnd] Session end metrics sent successfully', {
-      status,
-      reason,
-      wallClockDurationMs,
-      activeDurationMs
-    });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logger.warn(`[hook:SessionEnd] Failed to send metrics: ${errorMessage}`);
-    // Don't throw - metrics failures should not block agent execution
   }
 }
 

@@ -45,7 +45,8 @@ vi.mock('../../../providers/core/codemie-auth-helpers.js', async (importOriginal
   getStoredAnalyticsCredentials: vi.fn(async () => ({ credentials: { cookies: { session: 'abc' } } })),
 }));
 
-const { processEvent, createHookCommand, renameSessionFiles } = await import('../hook.js');
+const { processEvent, createHookCommand } = await import('../hook.js');
+const { renameSessionFiles } = await import('../../../agents/core/session/session-generation.js');
 const { finalizeOwnRecord, reconcileOtherSessions } = await import('../../../agents/core/session/stale-session-reconciliation.js');
 const { noticeDeliveryAtExit } = await import('../../../agents/core/session/exit-notice.js');
 const { logger } = await import('@/utils/logger.js');
