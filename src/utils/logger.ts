@@ -3,6 +3,7 @@ import { Writable } from 'node:stream';
 import * as fs from 'fs';
 import * as path from 'path';
 import chalk from 'chalk';
+import stripAnsi from 'strip-ansi';
 import { sanitizeLogArgs } from './security.js';
 import { getCodemiePath } from './paths.js';
 
@@ -335,11 +336,13 @@ class Logger {
   }
 
   success(message: string, ...args: unknown[]): void {
+    this.writeToLogFile('info', stripAnsi(message), ...args);
     this.consoleSink.log(chalk.green(`✓ ${message}`), ...args);
   }
 
-  /** A plain console status line: no prefix, no log-file write. */
+  /** A plain console status line, no prefix; the log file gets the same message at level info. */
   status(message: string): void {
+    this.writeToLogFile('info', stripAnsi(message));
     this.consoleSink.log(message);
   }
 

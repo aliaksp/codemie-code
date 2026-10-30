@@ -95,24 +95,32 @@ describe('Logger console sinks', () => {
     expect(stderrWrite).not.toHaveBeenCalled();
   });
 
-  it('writes success to stdout by default', async () => {
+  it('writes success to stdout by default, and its plain message to the log file at info', async () => {
     const { fresh, stderrWrite, stdout } = await freshLoggerWithStreamSpies();
     fresh.success('y');
     expect(stderrWrite).not.toHaveBeenCalled();
     expect(stdout()).toContain('✓ y');
+
+    const contents = await waitForLogContent(fresh.getLogFilePath()!, ' y');
+    // A fresh CODEMIE_HOME: the only file entry is the success line.
+    const lines = contents.trimEnd().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('[INFO]');
+    expect(lines[0].endsWith('] y')).toBe(true);
   });
 
-  it('writes a status line as is to stdout by default, and nothing to the log file', async () => {
+  it('writes a status line as is to stdout by default, and one info line with the message to the log file', async () => {
     const { fresh, stderrWrite, stdout } = await freshLoggerWithStreamSpies();
     fresh.status('m');
     expect(stdout()).toBe('m\n');
     expect(stderrWrite).not.toHaveBeenCalled();
 
-    fresh.info('after-status');
-    const contents = await waitForLogContent(fresh.getLogFilePath()!, 'after-status');
-    // A fresh CODEMIE_HOME: the only file entry is the info line written after the status.
-    expect(contents.trimEnd().split('\n')).toHaveLength(1);
-    expect(contents.trimEnd().endsWith(' after-status')).toBe(true);
+    const contents = await waitForLogContent(fresh.getLogFilePath()!, ' m');
+    // A fresh CODEMIE_HOME: the only file entry is the status line.
+    const lines = contents.trimEnd().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('[INFO]');
+    expect(lines[0].endsWith('] m')).toBe(true);
   });
 
   it('writes a status line as is to the stream given to setConsoleStream', async () => {
@@ -145,7 +153,7 @@ describe('Logger console sinks', () => {
     expect(consoleLog).not.toHaveBeenCalled();
   });
 
-  it('writes nothing to any console after setConsoleStream(null), and the file sink still receives every level it records', async () => {
+  it('writes nothing to any console after setConsoleStream(null), and the file sink still receives every level it records, success and status included', async () => {
     process.env.CODEMIE_DEBUG = '1';
     const { fresh, stdoutWrite, stderrWrite } = await freshLoggerWithStreamSpies();
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -166,6 +174,8 @@ describe('Logger console sinks', () => {
     expect(consoleWarn).not.toHaveBeenCalled();
     const contents = await waitForLogContent(fresh.getLogFilePath()!, 'null-error');
     expect(contents).toContain('null-debug');
+    expect(contents).toMatch(/\[INFO\][^\n]* null-success\n/);
+    expect(contents).toMatch(/\[INFO\][^\n]* null-status\n/);
     expect(contents).toContain('null-notice');
   });
 });

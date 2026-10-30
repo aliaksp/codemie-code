@@ -239,7 +239,7 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
 
     // Notification is forwarded as is: the SSO gate (and its browser sign-in) runs only on UserPromptSubmit.
     // The profile's baseUrl is a test-only URL with no stored SSO credentials, so the spawned daemon cannot start.
-    it('starting the proxy writes nothing to stdout or stderr; the cold start is in the file log', async () => {
+    async function runColdOtlpHook(extraEnv: Record<string, string>): Promise<{ home: string; res: RunResult; portHeldBefore: boolean }> {
       const home = freshHome();
       daemonHomes.push(home);
       writeFileSync(
@@ -267,7 +267,12 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
         notification_type: 'idle_prompt',
       });
 
-      const res = await run(home, ['hook', '--agent', 'claude-code-otlp'], notification, { CODEMIE_DEBUG: '1' });
+      const res = await run(home, ['hook', '--agent', 'claude-code-otlp'], notification, extraEnv);
+      return { home, res, portHeldBefore };
+    }
+
+    it('starting the proxy writes nothing to stdout or stderr; the cold start is in the file log', async () => {
+      const { home, res, portHeldBefore } = await runColdOtlpHook({ CODEMIE_DEBUG: '1' });
 
       expect(res.stdout).toBe('');
       expect(res.stderr).toBe('');
@@ -275,6 +280,30 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
       expect(existsSync(join(home, 'sso-login.lock'))).toBe(false);
       expect(await portHeld(DAEMON_PORT)).toBe(portHeldBefore);
     });
+
+    it('without CODEMIE_DEBUG the proxy status line still reaches the file log, and nothing reaches stdout or stderr', async () => {
+      const { home, res } = await runColdOtlpHook({});
+
+      expect(res.stdout).toBe('');
+      expect(res.stderr).toBe('');
+      expect(fileLog(home)).toMatch(/\[INFO\][^\n]* Starting proxy\.\.\.\n/);
+      expect(fileLog(home)).not.toContain('[DEBUG]');
+    });
+  });
+
+  // Spawned, not a processEvent unit call: the failure line is printed by the command's action, so the whole
+  // stderr of a missing CODEMIE_AGENT is observable only on the CLI process.
+  it('a missing CODEMIE_AGENT leaves only the failure line on stderr; the variable names go to the file log under CODEMIE_DEBUG', async () => {
+    const home = freshHome();
+    const res = await run(home, ['hook'], sessionStart(home), { CODEMIE_AGENT: '', CODEMIE_DEBUG: '1' });
+
+    expect(res.code).toBe(1);
+    expect(res.stdout).toBe('');
+    expect(res.stderr).not.toContain('[hook:debug]');
+    const lines = res.stderr.trimEnd().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe('codemie hook: SessionStart failed: CODEMIE_AGENT environment variable is required');
+    expect(fileLog(home)).toContain('[hook:debug] CODEMIE_AGENT missing. Available CODEMIE_* vars: ');
   });
 
   it('with CODEMIE_DEBUG=1 the hook keeps stdout and stderr empty and writes its debug lines to the file log', async () => {
