@@ -1171,10 +1171,11 @@ src/providers/plugins/sso/session/
    CLI wrapper (POSIX): SIGINT / SIGTERM / SIGHUP
    ├─ Forwarded to the agent's process tree first (descendants deepest first,
    │  then the agent); the proxy keeps running
-   ├─ Agent exits (no exit within 10 s of the first SIGTERM / SIGHUP / second
-   │  SIGINT → the agent's process tree is killed and the exit path below
-   │  finalizes, then the wrapper exits 128 + signal; a first SIGINT is forwarded
-   │  and arms nothing, since the agent may only interrupt its turn)
+   ├─ Agent exits (no exit within 10 s of the first SIGTERM / SIGHUP / SIGINT
+   │  within 2 s of the previous one → the agent's process tree is killed and the
+   │  exit path below finalizes, then the wrapper exits 128 + signal; any other
+   │  SIGINT is forwarded and arms nothing, since the agent may only interrupt its
+   │  turn)
    ├─ 2 s grace period for the agent's final API calls
    ├─ onSessionEnd
    └─ Cleanup below (proxy.stop())
