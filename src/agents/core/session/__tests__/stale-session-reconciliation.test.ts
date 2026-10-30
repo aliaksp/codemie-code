@@ -159,7 +159,8 @@ describe('reconcileOtherSessions', () => {
     expect(readFileSync(path, 'utf-8')).toBe(before);
   });
 
-  it('finalizes a record whose pid is alive but belongs to a process with another start time', async () => {
+  // The start time comes from the real `ps`; Windows has none and isOwnerAlive is pid-only there by design
+  it.skipIf(process.platform === 'win32')('finalizes a record whose pid is alive but belongs to a process with another start time', async () => {
     const reused = record({ ownerPid: process.pid, ownerStartedAt: Date.now() - 10 * 24 * HOUR });
     save(reused);
     const hook = pipeline();

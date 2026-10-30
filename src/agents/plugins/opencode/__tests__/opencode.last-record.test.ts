@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 
 vi.mock('@/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), success: vi.fn(), isDebugMode: () => false },
@@ -31,6 +31,8 @@ async function writeDb(dbPath: string, sql: string): Promise<void> {
     execFileSync('sqlite3', [dbPath, sql]);
   }
 }
+
+const hasSqlite3 = spawnSync('sqlite3', ['--version']).status === 0;
 
 const sqlText = (value: unknown) => `'${JSON.stringify(value).replace(/'/g, "''")}'`;
 
@@ -62,7 +64,7 @@ afterEach(() => {
 });
 
 describe('opencode lastRecordAt', () => {
-  it('SQLite: a running tool part written after every message time is the last record', async () => {
+  it.skipIf(!hasSqlite3)('SQLite: a running tool part written after every message time is the last record', async () => {
     const t0 = Date.now() - 30 * MINUTE;
     const dbPath = join(root, 'opencode.db');
     await writeDb(dbPath, `
