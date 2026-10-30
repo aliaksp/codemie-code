@@ -91,7 +91,6 @@ describe('ensureSessionFile (Risk 1 — session record clobbering)', () => {
   it('with no prior record writes a live record owned by this process, and a second call changes nothing', async () => {
     // onSessionStart swallows a processEvent throw, so nothing may have written the real
     // record by the time beforeRun runs: the placeholder must then be a normal live record.
-    const before = Date.now();
     const env = {
       CODEMIE_AGENT: 'opencode',
       CODEMIE_URL: 'https://codemie.example.com',
@@ -99,7 +98,9 @@ describe('ensureSessionFile (Risk 1 — session record clobbering)', () => {
       CODEMIE_MODEL: 'gpt-5.1',
     } as NodeJS.ProcessEnv;
     const { ensureSessionFile } = await import('../../../core/session/ensure-session.js');
+    const before = Date.now();
     await ensureSessionFile(SESSION_ID, env, 'opencode');
+    const after = Date.now();
 
     const { getSessionPath } = await import('../../../core/session/session-config.js');
     const written = readFileSync(getSessionPath(SESSION_ID), 'utf-8');
@@ -110,7 +111,8 @@ describe('ensureSessionFile (Risk 1 — session record clobbering)', () => {
     expect(session.correlation.agentSessionId).toBe(SESSION_ID);
     expect(session.ownerPid).toBe(process.pid);
     expect(typeof session.ownerStartedAt).toBe('number');
-    expect(Math.abs(session.startTime - before)).toBeLessThan(100);
+    expect(session.startTime).toBeGreaterThanOrEqual(before);
+    expect(session.startTime).toBeLessThanOrEqual(after);
     // The start pass delivers a stranded record to its own host, under its client and model
     expect(session.codemieUrl).toBe('https://codemie.example.com');
     expect(session.clientType).toBe('codemie-opencode');
