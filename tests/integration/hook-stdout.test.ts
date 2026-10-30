@@ -371,7 +371,8 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
       rmSync(pkg, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
-    const OTHER_VERSION = '0.0.2';
+    // Above the installed version, so it is outside the notice's last-seen..installed range.
+    const OTHER_VERSION = '99.0.0';
     const WITH_ENTRY = [
       '# Changelog',
       '',
@@ -440,27 +441,29 @@ describe('hook process stdout (codemie hook / codemie sound)', () => {
       expect(marker(home)).toBe(VERSION);
     });
 
-    it('in a terminal, no entry for the installed version prints nothing and still writes the marker', async () => {
+    it('in a terminal, no entry for the installed version prints no notes and still writes the marker', async () => {
       writeChangelog(WITHOUT_ENTRY);
       const home = await warmHome();
       writeFileSync(join(home, '.last-seen-version'), OLD_MARKER, 'utf-8');
 
       const out = await runInTerminal(home, ['list']);
 
-      expect(out).not.toContain('Updated to');
+      expect(out).toContain(`Updated to ${VERSION}`);
+      expect(out).toContain('codemie whatsnew --all');
       expect(out).not.toContain("What's new in");
+      expect(out).not.toContain('Newer entry bullet');
       expect(marker(home)).toBe(VERSION);
     });
 
-    it('codemie whatsnew for a version without an entry still shows the newest entry', async () => {
+    it('codemie whatsnew for a version without an entry says so and shows no other version', async () => {
       writeChangelog(WITHOUT_ENTRY);
       const home = await warmHome();
 
       const res = await run(home, ['whatsnew', VERSION], '', {}, join(pkg, 'bin', 'codemie.js'));
 
       expect(res.code).toBe(0);
-      expect(res.stdout).toContain(`What's new in ${OTHER_VERSION}`);
-      expect(res.stdout).toContain('Newer entry bullet');
+      expect(res.stdout).toContain(`No release notes for ${VERSION}`);
+      expect(res.stdout).not.toContain('Newer entry bullet');
     });
   });
 });
