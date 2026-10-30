@@ -787,6 +787,11 @@ async function createSessionRecord(event: SessionStartEvent, sessionId: string, 
     // leaving an `active` record that still carries a past endTime. A post-clear session must start
     // fresh, so completed records fall through to the fresh-build below. (resume runs in a new CLI
     // process with a fresh CODEMIE_SESSION_ID, so it never reaches this branch.)
+    // An undelivered previous generation still at `{id}.json` stays in the delivery queue
+    if ((await readLiveRecord(sessionId))?.status === 'completed') {
+      logger.error(`[hook:SessionStart] /clear: the previous generation of ${sessionId} could not be closed; the fresh record is not written`);
+      return;
+    }
     const existing = await sessionStore.loadSession(sessionId);
     if (existing && existing.status === 'active' && existing.endTime === undefined) {
       const {
@@ -1119,7 +1124,12 @@ async function closeClearedGeneration(sessionId: string, config: HookProcessingC
     const { acquirePidLock, PID_LOCK_WAIT_BUDGET_MS } = await import('../../utils/pid-lock.js');
     const lockDeadlineMs = Math.min(Date.now() + PID_LOCK_WAIT_BUDGET_MS, options.deadlineMs ?? Infinity);
 
-    const lock = await acquirePidLock(reconcileLockPath(sessionId), { mode: 'wait', deadlineMs: lockDeadlineMs, signal: options.abortSignal });
+    const lock = await acquirePidLock(reconcileLockPath(sessionId), {
+      mode: 'wait',
+      deadlineMs: lockDeadlineMs,
+      signal: options.abortSignal,
+      pidOnlyLiveness: options.hookProcess === true,
+    });
     if (!lock) {
       logger.warn(`[hook:SessionStart] /clear: the previous generation of ${sessionId} is locked by another process; left in place`);
       return;

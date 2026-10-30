@@ -133,6 +133,19 @@ describe('checkStatus', () => {
     expect(running).toBe(false);
     expect(existsSync(TEST_STATE_FILE)).toBe(false);
   });
+
+  it('returns running=false and cleans the state when its pid now belongs to another user', async () => {
+    await writeState({ ...SAMPLE_STATE, pid: 4242 }, TEST_STATE_FILE);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    });
+    try {
+      expect(await checkStatus(TEST_STATE_FILE)).toEqual({ running: false, state: null });
+    } finally {
+      kill.mockRestore();
+    }
+    expect(existsSync(TEST_STATE_FILE)).toBe(false);
+  });
 });
 
 describe('stopDaemon', () => {

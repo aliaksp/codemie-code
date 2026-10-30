@@ -124,6 +124,17 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+/** For daemon state, whose pid must be our own process: `EPERM` (another user's process) reads as dead. */
+export function isProcessAliveStrict(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Env vars a CLI wrapper exports to its agent so a session record can name the process that owns it. */
 export const WRAPPER_PID_ENV = 'CODEMIE_WRAPPER_PID';
 export const WRAPPER_STARTED_AT_ENV = 'CODEMIE_WRAPPER_STARTED_AT';

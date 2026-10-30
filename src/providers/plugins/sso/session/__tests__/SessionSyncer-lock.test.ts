@@ -12,6 +12,12 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return { ...actual, rename: vi.fn(actual.rename), unlink: vi.fn(actual.unlink) };
 });
 
+// Process spawns are a boundary: a hook process's lock check must never spawn `ps`
+vi.mock('@/utils/exec.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/exec.js')>();
+  return { ...actual, exec: vi.fn(actual.exec) };
+});
+
 const mockLoadSession = vi.fn();
 const mockSaveSession = vi.fn().mockResolvedValue(undefined);
 
@@ -125,6 +131,20 @@ describe('SessionSyncer — cross-process sync lock', () => {
     expect(mockConvProcess).not.toHaveBeenCalled();
     // The foreign lock must not be removed
     expect(existsSync(lockPath)).toBe(true);
+  });
+
+  it('in a hook process defers on a live pid whose lock names another start time, without spawning ps', async () => {
+    const holder = JSON.stringify({ pid: process.pid, startedAt: 1 });
+    writeFileSync(lockPath, holder);
+    const { exec } = await import('@/utils/exec.js');
+
+    const { SessionSyncer } = await import('../SessionSyncer.js');
+    const result = await new SessionSyncer().sync('session-1', { ...context, hookProcess: true });
+
+    expect(result.message).toBe('Sync in progress in another process, deferred');
+    expect(mockMetricsProcess).not.toHaveBeenCalled();
+    expect(readFileSync(lockPath, 'utf-8')).toBe(holder);
+    expect(vi.mocked(exec).mock.calls.filter(([command]) => command === 'ps')).toEqual([]);
   });
 
   it('takes over a lock whose holder pid is dead at once, syncs, and releases it', async () => {

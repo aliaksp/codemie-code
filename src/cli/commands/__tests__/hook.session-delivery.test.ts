@@ -752,6 +752,29 @@ describe('SessionEnd inside the agent hook process', () => {
     expect(readRecord(session.sessionId, 'completed_').reason).toBe('interrupted');
   });
 
+  it('a /clear meets the reconcile lock another live process holds: no ps spawned, the previous generation left in place', async () => {
+    const session = baseRecord({ correlation: { status: 'matched', retryCount: 0, agentSessionId: 'gen-locked' } });
+    writeRecord(session);
+    const { processStartedAt } = await import('../../../utils/processes.js');
+    writeFileSync(join(sessionsDir, `${session.sessionId}.reconcile.lock`), JSON.stringify({ pid: process.pid, startedAt: processStartedAt() }));
+    vi.mocked(exec).mockClear();
+
+    // The fake clock runs out the lock wait without waiting it in real time
+    await onFakeClock(() => runHook({
+      hook_event_name: 'SessionStart',
+      session_id: 'claude-native-next',
+      transcript_path: join(home, 'next.jsonl'),
+      permission_mode: 'default',
+      cwd: home,
+      source: 'clear',
+    }, session));
+
+    expect(vi.mocked(exec).mock.calls.filter(([command]) => command === 'ps')).toEqual([]);
+    expect(readdirSync(sessionsDir).filter((name) => name.includes('gen-locked'))).toEqual([]);
+    expect(readRecord(session.sessionId).startTime).toBe(session.startTime);
+    expect(vi.mocked(logger.warn).mock.calls.some(([line]) => String(line).includes('locked by another process; left in place'))).toBe(true);
+  });
+
   it('the hook\'s sync meets a sync lock another live process holds: no ps spawned, the line kept pending', async () => {
     const session = baseRecord();
     writeRecord(session);
@@ -1022,6 +1045,26 @@ describe('SessionStart source=clear closes the previous generation', () => {
     expect(existsSync(join(sessionsDir, `completed_${session.sessionId}-gen-stuck-move.json`))).toBe(false);
     expect(readRecord(session.sessionId, 'completed_').correlation.agentSessionId).toBe('gen-stuck-move');
     expect(vi.mocked(logger.error).mock.calls.some(([line]) => String(line).includes('failed to close the previous generation'))).toBe(true);
+  });
+
+  it('a completed {id}.json the close could not move stays as it is: no fresh record over it, the error logged', async () => {
+    // Another host's generation: closed locally, sent nothing, so only the failed move touches it
+    const session = baseRecord({ status: 'completed', endTime: Date.now(), codemieUrl: 'https://other.example.com', correlation: { status: 'matched', retryCount: 0, agentSessionId: 'gen-unmoved' } });
+    writeRecord(session);
+    writeDeltas(session.sessionId, [{ timestamp: session.startTime + SECOND }]);
+    const recordBefore = readFileSync(join(sessionsDir, `${session.sessionId}.json`), 'utf-8');
+    const deltasBefore = readFileSync(join(sessionsDir, `${session.sessionId}_metrics.jsonl`), 'utf-8');
+    const actualRename = (await vi.importActual<typeof import('fs/promises')>('fs/promises')).rename;
+    vi.mocked(rename).mockImplementation(async (from, to) => {
+      if (String(to).endsWith('-gen-unmoved.json')) throw new Error('EPERM: rename');
+      return actualRename(from, to);
+    });
+
+    await processEvent(clearStart(), config(session));
+
+    expect(readFileSync(join(sessionsDir, `${session.sessionId}.json`), 'utf-8')).toBe(recordBefore);
+    expect(readFileSync(join(sessionsDir, `${session.sessionId}_metrics.jsonl`), 'utf-8')).toBe(deltasBefore);
+    expect(vi.mocked(logger.error).mock.calls.some(([line]) => String(line).includes('could not be closed; the fresh record is not written'))).toBe(true);
   });
 
   it('a move killed after its first rename leaves the .json under its own name', async () => {
