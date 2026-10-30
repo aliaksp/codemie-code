@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFile } from 'fs/promises';
-import { mkdtemp } from 'fs/promises';
+import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Console } from 'node:console';
@@ -177,5 +177,37 @@ describe('Logger console sinks', () => {
     expect(contents).toMatch(/\[INFO\][^\n]* null-success\n/);
     expect(contents).toMatch(/\[INFO\][^\n]* null-status\n/);
     expect(contents).toContain('null-notice');
+  });
+});
+
+describe('Logger.close', () => {
+  const homes: string[] = [];
+
+  afterEach(async () => {
+    await logger.close();
+    if (ORIGINAL_CODEMIE_HOME === undefined) delete process.env.CODEMIE_HOME;
+    else process.env.CODEMIE_HOME = ORIGINAL_CODEMIE_HOME;
+    for (const home of homes.splice(0)) await rm(home, { recursive: true, force: true });
+  });
+
+  it('releases the log file so its home can be removed, and the next write opens a file under the new home', async () => {
+    const first = await mkdtemp(join(tmpdir(), 'codemie-logger-close-a-'));
+    const second = await mkdtemp(join(tmpdir(), 'codemie-logger-close-b-'));
+    homes.push(first, second);
+
+    process.env.CODEMIE_HOME = first;
+    await logger.close();
+    logger.info('before-close');
+    expect(logger.getLogFilePath()!.startsWith(first)).toBe(true);
+    await waitForLogContent(logger.getLogFilePath()!, 'before-close');
+    await logger.close();
+    await rm(first, { recursive: true, force: true });
+
+    process.env.CODEMIE_HOME = second;
+    logger.info('after-close');
+    const reopened = logger.getLogFilePath();
+    expect(reopened).not.toBeNull();
+    expect(reopened!.startsWith(second)).toBe(true);
+    expect(await waitForLogContent(reopened!, 'after-close')).toContain('[INFO]');
   });
 });

@@ -250,7 +250,8 @@ class Logger {
 
   /**
    * Flush and close the write stream
-   * Returns a Promise that resolves when all data is flushed
+   * Returns a Promise that resolves once the file is flushed and its handle released;
+   * the next write opens the log file again under the current CODEMIE_HOME
    * Waits for any in-progress rotation to complete before closing
    */
   async close(): Promise<void> {
@@ -262,15 +263,17 @@ class Logger {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    return new Promise((resolve) => {
-      if (this.writeStream) {
-        this.writeStream.end(() => {
-          this.writeStream = null;
-          resolve();
-        });
-      } else {
-        resolve();
-      }
+    const stream = this.writeStream;
+    this.writeStream = null;
+    this.logFilePath = null;
+    this.currentLogDate = null;
+    this.logFileInitialized = false;
+    if (!stream || stream.closed) return;
+
+    // 'close', not the end() callback ('finish'): only 'close' means the fd is released.
+    await new Promise<void>((resolve) => {
+      stream.once('close', () => resolve());
+      stream.end();
     });
   }
 

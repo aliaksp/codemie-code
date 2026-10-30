@@ -460,6 +460,8 @@ describe('ConfigLoader - workspace resolution and project-only composition', () 
     });
 
     afterEach(async () => {
+      // The logger keeps its log file under TEST_DIR open; Windows cannot remove it while open.
+      await logger.close();
       await fs.rm(TEST_DIR, { recursive: true, force: true });
       vi.restoreAllMocks();
       (ConfigLoader as unknown as { GLOBAL_CONFIG: string }).GLOBAL_CONFIG = ORIGINAL_GLOBAL_CONFIG;
