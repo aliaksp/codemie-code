@@ -292,6 +292,71 @@ describe('BaseAgentAdapter.run signals and output streams', () => {
       expect(events).toEqual(['kill:SIGINT', 'kill:SIGTERM', 'kill:SIGKILL', 'onSessionEnd', 'proxyStop']);
     });
 
+    it('arms the fallback from a second SIGINT and exits with 130 after the kill 10 s after it', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      await startRun();
+
+      signalHandler('SIGINT')('SIGINT');
+      await vi.advanceTimersByTimeAsync(5_000);
+      signalHandler('SIGINT')('SIGINT');
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT']);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGKILL']);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      child.emit('exit', null, 'SIGKILL');
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130));
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGKILL', 'onSessionEnd', 'proxyStop']);
+      expect(exitSignals).toEqual(['SIGINT']);
+    });
+
+    it('keeps the fallback armed by a second SIGINT when a SIGTERM follows and exits with 130', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      await startRun();
+
+      signalHandler('SIGINT')('SIGINT');
+      signalHandler('SIGINT')('SIGINT');
+      await vi.advanceTimersByTimeAsync(5_000);
+      signalHandler('SIGTERM')('SIGTERM');
+      expect(vi.getTimerCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGTERM']);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGTERM', 'kill:SIGKILL']);
+
+      child.emit('exit', null, 'SIGKILL');
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130));
+      expect(exitSpy).not.toHaveBeenCalledWith(143);
+      expect(exitSignals).toEqual(['SIGINT']);
+    });
+
+    it('arms one fallback for three SIGINTs and kills the child once', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      await startRun();
+
+      signalHandler('SIGINT')('SIGINT');
+      signalHandler('SIGINT')('SIGINT');
+      await vi.advanceTimersByTimeAsync(5_000);
+      signalHandler('SIGINT')('SIGINT');
+      expect(vi.getTimerCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGINT', 'kill:SIGKILL']);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGINT', 'kill:SIGKILL']);
+
+      child.emit('exit', null, 'SIGKILL');
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130));
+      expect(events).toEqual(['kill:SIGINT', 'kill:SIGINT', 'kill:SIGINT', 'kill:SIGKILL', 'onSessionEnd', 'proxyStop']);
+    });
+
     it.each([
       ['SIGHUP', 'SIGHUP'],
       ['SIGTERM', 'SIGTERM'],

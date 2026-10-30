@@ -7,10 +7,11 @@ import { signalTree } from '../../utils/processes.js';
 import { logger } from '../../utils/logger.js';
 
 /**
- * How long the wrapper waits for the agent to exit after forwarding it SIGTERM or
- * SIGHUP before killing it; the child-exit path then finalizes the session. A
- * forwarded SIGINT arms no such timer: the agent may only interrupt its turn and
- * keep running.
+ * How long the wrapper waits for the agent to exit after forwarding it SIGTERM,
+ * SIGHUP or a second SIGINT before killing it; the child-exit path then finalizes
+ * the session. A first SIGINT arms no such timer: the agent may only interrupt its
+ * turn and keep running, while a second one is an exit request whose wait stays
+ * bounded.
  */
 const SIGNAL_FALLBACK_MS = 10_000;
 
@@ -117,10 +118,11 @@ export function installWin32SignalHandlers(child: ChildProcess, displayName: str
  * the agent's own session-end traffic still reaches it; the child-exit path
  * then finishes the session as on a normal exit. Once that path runs,
  * SIGINT / SIGTERM take their default action (a hung finalization can still
- * be stopped) and a late SIGHUP is ignored. Only the first SIGTERM or SIGHUP
- * arms the fallback; SIGINT arms nothing, since the agent may just interrupt
- * its turn and keep running with the proxy. After 10 s the fallback kills the
- * agent's tree and the child-exit path finalizes.
+ * be stopped) and a late SIGHUP is ignored. The first of a SIGTERM, a SIGHUP or
+ * a second SIGINT the wrapper receives arms the fallback; a first SIGINT arms
+ * nothing, since the agent may just interrupt its turn and keep running with the
+ * proxy, while a second one is an exit request whose wait stays bounded. After
+ * 10 s the fallback kills the agent's tree and the child-exit path finalizes.
  *
  * Every SIGINT / SIGTERM / SIGHUP is forwarded, so a terminal Ctrl+C in cooked
  * mode reaches the agent twice (the terminal's and the forwarded one): a known
@@ -130,6 +132,7 @@ export function installPosixSignalHandlers(child: ChildProcess, displayName: str
   let childExited = false;
   let signalFallbackTimer: NodeJS.Timeout | undefined;
   let firedFor: NodeJS.Signals | undefined;
+  let sigintCount = 0;
 
   const forwardSignal = (signal: NodeJS.Signals) => {
     if (childExited) {
@@ -137,7 +140,7 @@ export function installPosixSignalHandlers(child: ChildProcess, displayName: str
     }
     logger.debug(`[${displayName}] got ${signal} -> forwarded`);
     signalChildTree(child, signal);
-    if (signal === 'SIGINT') {
+    if (signal === 'SIGINT' && ++sigintCount === 1) {
       return;
     }
     signalFallbackTimer ??= setTimeout(() => {
