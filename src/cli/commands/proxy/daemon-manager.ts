@@ -154,7 +154,15 @@ export async function stopDaemon(): Promise<void> {
   }
 
   // 1. Graceful: SIGTERM, wait up to 5s.
-  process.kill(state.pid, 'SIGTERM');
+  try {
+    process.kill(state.pid, 'SIGTERM');
+  } catch (error) {
+    // ESRCH: gone since the check; EPERM: the pid now belongs to another user — not our daemon either way
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ESRCH' && code !== 'EPERM') throw error;
+    await clearState(stateFile);
+    return;
+  }
   for (let i = 0; i < 50; i++) {
     await new Promise<void>(r => setTimeout(r, 100));
     if (!isProcessAlive(state.pid)) {
